@@ -120,7 +120,6 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 	}
 
 	opts := []libp2p.Option{
-		libp2p.ShareTCPListener(),
 		libp2p.ListenAddrStrings(listenAddrs...),
 		security,
 		// Use dedicated peerstore instead the global DefaultPeerstore
@@ -374,16 +373,6 @@ func (s *Service) handleIncoming(stream network.Stream) {
 		return
 	}
 
-	if i.FullNode {
-		err = s.addressbook.Put(i.BzzAddress.Overlay, *i.BzzAddress)
-		if err != nil {
-			s.logger.Debug("stream handler: addressbook put error", "peer_id", peerID, "error", err)
-			s.logger.Error(nil, "stream handler: unable to persist peer", "peer_id", peerID)
-			_ = s.Disconnect(i.BzzAddress.Overlay, "unable to persist peer in addressbook")
-			return
-		}
-	}
-
 	peer := p2p.Peer{Address: overlay, FullNode: i.FullNode, EthereumAddress: i.BzzAddress.EthereumAddress}
 
 	s.protocolsmu.RLock()
@@ -400,53 +389,25 @@ func (s *Service) handleIncoming(stream network.Stream) {
 	s.protocolsmu.RUnlock()
 
 	if s.notifier != nil {
-		if !i.FullNode {
-			s.lightNodes.Connected(s.ctx, peer)
-			// light node announces explicitly
-			if err := s.notifier.Announce(s.ctx, peer.Address, i.FullNode); err != nil {
-				s.logger.Debug("stream handler: notifier.Announce failed", "peer", peer.Address, "error", err)
-			}
+		s.lightNodes.Connected(s.ctx, peer)
+		// light node announces explicitly
+		if err := s.notifier.Announce(s.ctx, peer.Address, i.FullNode); err != nil {
+			s.logger.Debug("stream handler: notifier.Announce failed", "peer", peer.Address, "error", err)
+		}
 
-			if s.lightNodes.Count() > s.lightNodeLimit {
-				// kick another node to fit this one in
-				p, err := s.lightNodes.RandomPeer(peer.Address)
-				if err != nil {
-					s.logger.Debug("stream handler: can't find a peer slot for light node", "error", err)
-					_ = s.Disconnect(peer.Address, "unable to find peer slot for light node")
-					return
-				} else {
-					loggerV1.Debug("stream handler: kicking away light node to make room for new node", "old_peer", p.String(), "new_peer", peer.Address)
+		if s.lightNodes.Count() > s.lightNodeLimit {
+			// kick another node to fit this one in
+			p, err := s.lightNodes.RandomPeer(peer.Address)
+			if err != nil {
+				s.logger.Debug("stream handler: can't find a peer slot for light node", "error", err)
+				_ = s.Disconnect(peer.Address, "unable to find peer slot for light node")
+				return
+			} else {
+				loggerV1.Debug("stream handler: kicking away light node to make room for new node", "old_peer", p.String(), "new_peer", peer.Address)
 
-					_ = s.Disconnect(p, "kicking away light node to make room for peer")
-					return
-				}
-			}
-		} else {
-			if err := s.notifier.Connected(s.ctx, peer, false); err != nil {
-				s.logger.Debug("stream handler: notifier.Connected: peer disconnected", "peer", i.BzzAddress.Overlay, "error", err)
-				// note: this cannot be unit tested since the node
-				// waiting on handshakeStream.FullClose() on the other side
-				// might actually get a stream reset when we disconnect here
-				// resulting in a flaky response from the Connect method on
-				// the other side.
-				// that is why the Pick method has been added to the notifier
-				// interface, in addition to the possibility of deciding whether
-				// a peer connection is wanted prior to adding the peer to the
-				// peer registry and starting the protocols.
-				_ = s.Disconnect(overlay, "unable to signal connection notifier")
+				_ = s.Disconnect(p, "kicking away light node to make room for peer")
 				return
 			}
-			// when a full node connects, we gossip about it to the
-			// light nodes so that they can also have a chance at building
-			// a solid topology.
-			_ = s.lightNodes.EachPeer(func(addr swarm.Address, _ uint8) (bool, bool, error) {
-				go func(addressee, peer swarm.Address, fullnode bool) {
-					if err := s.notifier.AnnounceTo(s.ctx, addressee, peer, fullnode); err != nil {
-						s.logger.Debug("stream handler: notifier.AnnounceTo failed", "addressee", addressee, "peer", peer, "error", err)
-					}
-				}(addr, peer.Address, i.FullNode)
-				return false, false, nil
-			})
 		}
 	}
 
@@ -493,7 +454,6 @@ func (s *Service) Blocklist(overlay swarm.Address, duration time.Duration, reaso
 }
 
 func (s *Service) Connect(ctx context.Context, addr ma.Multiaddr) (address *bzz.Address, err error) {
-	loggerV1 := s.logger.V(1).Register()
 
 	defer func() {
 		err = s.determineCurrentNetworkStatus(err)
@@ -534,86 +494,16 @@ func (s *Service) Connect(ctx context.Context, addr ma.Multiaddr) (address *bzz.
 	}
 
 	handshakeStream := newStream(stream)
-	i, err := s.handshakeService.Handshake(ctx, handshakeStream, stream.Conn().RemoteMultiaddr(), stream.Conn().RemotePeer())
+	_, err = s.handshakeService.Handshake(ctx, handshakeStream, stream.Conn().RemoteMultiaddr(), stream.Conn().RemotePeer())
 	if err != nil {
 		_ = handshakeStream.Reset()
 		_ = s.host.Network().ClosePeer(info.ID)
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
 
-	if !i.FullNode {
-		_ = handshakeStream.Reset()
-		_ = s.host.Network().ClosePeer(info.ID)
-		return nil, p2p.ErrDialLightNode
-	}
-
-	overlay := i.BzzAddress.Overlay
-
-	blocked, err := s.blocklist.Exists(overlay)
-	if err != nil {
-		s.logger.Debug("blocklisting: exists failed", "peer_id", info.ID, "error", err)
-		s.logger.Error(nil, "internal error while connecting with peer", "peer_id", info.ID)
-		_ = handshakeStream.Reset()
-		_ = s.host.Network().ClosePeer(info.ID)
-		return nil, err
-	}
-
-	if blocked {
-		s.logger.Error(nil, "blocked connection to blocklisted peer", "peer_id", info.ID)
-		_ = handshakeStream.Reset()
-		_ = s.host.Network().ClosePeer(info.ID)
-		return nil, p2p.ErrPeerBlocklisted
-	}
-
-	if exists := s.peers.addIfNotExists(stream.Conn(), overlay, i.FullNode); exists {
-		if err := handshakeStream.FullClose(); err != nil {
-			_ = s.Disconnect(overlay, "failed closing handshake stream after connect")
-			return nil, fmt.Errorf("peer exists, full close: %w", err)
-		}
-
-		return i.BzzAddress, nil
-	}
-
-	if err := handshakeStream.FullClose(); err != nil {
-		_ = s.Disconnect(overlay, "could not fully close handshake stream after connect")
-		return nil, fmt.Errorf("connect full close %w", err)
-	}
-
-	if i.FullNode {
-		err = s.addressbook.Put(overlay, *i.BzzAddress)
-		if err != nil {
-			_ = s.Disconnect(overlay, "failed storing peer in addressbook")
-			return nil, fmt.Errorf("storing bzz address: %w", err)
-		}
-	}
-
-	s.protocolsmu.RLock()
-	for _, tn := range s.protocols {
-		if tn.ConnectOut != nil {
-			if err := tn.ConnectOut(ctx, p2p.Peer{Address: overlay, FullNode: i.FullNode, EthereumAddress: i.BzzAddress.EthereumAddress}); err != nil {
-				s.logger.Debug("connectOut: failed to connect", "protocol", tn.Name, "version", tn.Version, "peer", overlay, "error", err)
-				_ = s.Disconnect(overlay, "failed to process outbound connection notifier")
-				s.protocolsmu.RUnlock()
-				return nil, fmt.Errorf("connectOut: protocol: %s, version:%s: %w", tn.Name, tn.Version, err)
-			}
-		}
-	}
-	s.protocolsmu.RUnlock()
-
-	if !s.peers.Exists(overlay) {
-		_ = s.Disconnect(overlay, "outbound peer does not exist")
-		return nil, fmt.Errorf("libp2p connect: peer %s does not exist %w", overlay, p2p.ErrPeerNotFound)
-	}
-
-	if s.reacher != nil {
-		s.reacher.Connected(overlay, i.BzzAddress.Underlay)
-	}
-
-	peerUserAgent := appendSpace(s.peerUserAgent(ctx, info.ID))
-
-	loggerV1.Debug("successfully connected to peer (outbound)", "addresses", i.BzzAddress.ShortString(), "light", i.LightString(), "user_agent", peerUserAgent)
-	s.logger.Debug("successfully connected to peer (outbound)", "address", i.BzzAddress.Overlay, "light", i.LightString(), "user_agent", peerUserAgent)
-	return i.BzzAddress, nil
+	_ = handshakeStream.Reset()
+	_ = s.host.Network().ClosePeer(info.ID)
+	return nil, p2p.ErrDialLightNode
 }
 
 func (s *Service) Disconnect(overlay swarm.Address, reason string) (err error) {
