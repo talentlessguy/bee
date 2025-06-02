@@ -31,7 +31,6 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/p2p/libp2p"
 	"github.com/ethersphere/bee/v2/pkg/pingpong"
 	"github.com/ethersphere/bee/v2/pkg/postage"
-	"github.com/ethersphere/bee/v2/pkg/postage/batchstore"
 	"github.com/ethersphere/bee/v2/pkg/pricer"
 	"github.com/ethersphere/bee/v2/pkg/pricing"
 	"github.com/ethersphere/bee/v2/pkg/pss"
@@ -225,31 +224,15 @@ func NewBee(
 		chainID            int64
 		transactionService transaction.Service
 		transactionMonitor transaction.Monitor
-		chequebookFactory  chequebook.Factory
 		chequebookService  chequebook.Service = new(noOpChequebookService)
 		chequeStore        chequebook.ChequeStore
 		cashoutService     chequebook.CashoutService
 		erc20Service       erc20.Service
 	)
 
-	chainEnabled := isChainEnabled(o, o.BlockchainRpcEndpoint, logger)
+	chainEnabled := false
 
 	var batchStore postage.Storer = new(postage.NoOpBatchStore)
-	var evictFn func([]byte) error
-
-	if chainEnabled {
-		batchStore, err = batchstore.New(
-			stateStore,
-			func(id []byte) error {
-				return evictFn(id)
-			},
-			reserveCapacity,
-			logger,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("batchstore: %w", err)
-		}
-	}
 
 	chainBackend, overlayEthAddress, chainID, transactionMonitor, transactionService, err = InitChain(
 		ctx,
@@ -361,48 +344,6 @@ func NewBee(
 		if err != nil {
 			return nil, fmt.Errorf("waiting backend sync: %w", err)
 		}
-	}
-
-	if o.SwapEnable {
-		chequebookFactory, err = InitChequebookFactory(logger, chainBackend, chainID, transactionService, o.SwapFactoryAddress)
-		if err != nil {
-			return nil, fmt.Errorf("init chequebook factory: %w", err)
-		}
-
-		erc20Address, err := chequebookFactory.ERC20Address(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("factory fail: %w", err)
-		}
-
-		erc20Service = erc20.New(transactionService, erc20Address)
-
-		if o.ChequebookEnable && chainEnabled {
-			chequebookService, err = InitChequebookService(
-				ctx,
-				logger,
-				stateStore,
-				signer,
-				chainID,
-				chainBackend,
-				overlayEthAddress,
-				transactionService,
-				chequebookFactory,
-				o.SwapInitialDeposit,
-				erc20Service,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("init chequebook service: %w", err)
-			}
-		}
-
-		chequeStore, cashoutService = initChequeStoreCashout(
-			stateStore,
-			chainBackend,
-			chequebookFactory,
-			chainID,
-			overlayEthAddress,
-			transactionService,
-		)
 	}
 
 	lightNodes := lightnode.NewContainer(swarmAddress)
@@ -585,7 +526,6 @@ func NewBee(
 		return nil, fmt.Errorf("localstore: %w", err)
 	}
 	b.localstoreCloser = localStore
-	evictFn = func(id []byte) error { return localStore.EvictBatch(context.Background(), id) }
 
 	if resetReserve {
 		logger.Warning("resetting the reserve")
